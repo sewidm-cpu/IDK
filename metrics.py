@@ -1,69 +1,74 @@
 """
-Compute SaaS and general financial metrics from Yahoo Finance / EDGAR data.
+Financial metrics computed from the structured financials dict (edgar.py schema).
 
-Company types detected:
-  SAAS      — software/cloud/subscription
-  CYCLICAL  — energy, mining, semis, autos, steel, chemicals
-  DEFENSE   — aerospace & defense
-  FINANCIAL — banks, insurance, asset managers
-  REIT      — real estate investment trusts
-  BIOTECH   — pre-revenue or clinical-stage biotech
-  GENERAL   — everything else
+All compute_* functions accept:
+  info        — Yahoo Finance info dict (price, market cap, beta, sector, etc.)
+  financials  — structured dict from edgar.get_edgar_financials() or yf_dfs_to_structured()
 """
 
 import numpy as np
-import pandas as pd
 from typing import Optional
 
 
-def _ttm_value(quarterly_df: pd.DataFrame, row_label_matches: list) -> Optional[float]:
-    """Sum last 4 quarters for a given line item."""
-    if quarterly_df is None or quarterly_df.empty:
+# ---------------------------------------------------------------------------
+# Helpers retained for edgar.yf_dfs_to_structured fallback
+# ---------------------------------------------------------------------------
+
+def _get_annual_series(df, label_matches: list, n: int = 7) -> list:
+    """Extract up to n annual values from a yfinance DataFrame (most-recent first)."""
+    if df is None or df.empty:
+        return []
+    for row_label in df.index:
+        if any(m.lower() in str(row_label).lower() for m in label_matches):
+            return [float(v) for v in df.loc[row_label].dropna().sort_index(ascending=False).values[:n]]
+    return []
+
+
+def _ttm_value(q_df, label_matches: list) -> Optional[float]:
+    """Sum last 4 quarters from a yfinance quarterly DataFrame."""
+    if q_df is None or q_df.empty:
         return None
-    for row_label in quarterly_df.index:
-        if any(m.lower() in str(row_label).lower() for m in row_label_matches):
-            vals = quarterly_df.loc[row_label].dropna().sort_index(ascending=False).head(4)
+    for row_label in q_df.index:
+        if any(m.lower() in str(row_label).lower() for m in label_matches):
+            vals = q_df.loc[row_label].dropna().sort_index(ascending=False).head(4)
             if len(vals) >= 2:
                 return float(vals.sum())
     return None
 
 
 def _compute_ttm_fcf(info: dict, financials: dict) -> Optional[float]:
-    """
-    Robustly compute TTM FCF.
-    Priority: info["freeCashflow"] → quarterly OpCF-CapEx → annual OpCF-CapEx
-    """
-    # Yahoo pre-computes TTM FCF — most reliable
-    fcf = info.get("freeCashflow")
-    if fcf is not None:
-        return fcf
+    """Retained for edgar.yf_dfs_to_structured; real path uses financials['fcf_ttm']."""
+    return (
+        financials.get("fcf_ttm")
+        or info.get("freeCashflow")
+    )
 
-    # Compute from quarterly: Operating CF - |CapEx|
-    q_cf = financials.get("quarterly_cashflow")
-    if q_cf is not None and not q_cf.empty:
-        op_cf = _ttm_value(q_cf, ["operating cash flow", "cash from operations",
-                                   "net cash from operating"])
-        capex = _ttm_value(q_cf, ["capital expenditure", "capital expenditures",
-                                   "purchase of property", "capex"])
-        if op_cf is not None and capex is not None:
-            return op_cf - abs(capex)
-        # Try direct free cash flow row
-        direct = _ttm_value(q_cf, ["free cash flow"])
-        if direct is not None:
-            return direct
 
-    # Fall back to most recent annual
-    cf = financials.get("cashflow")
-    if cf is not None and not cf.empty:
-        op_vals  = _get_annual_series(cf, ["operating cash flow", "cash from operations"], 1)
-        cap_vals = _get_annual_series(cf, ["capital expenditure", "capital expenditures",
-                                           "purchase of property"], 1)
-        if op_vals and cap_vals:
-            return op_vals[0] - abs(cap_vals[0])
-        direct = _get_annual_series(cf, ["free cash flow"], 1)
-        if direct:
-            return direct[0]
+# ---------------------------------------------------------------------------
+# Structured dict accessors
+# ---------------------------------------------------------------------------
 
+def _annual(fin: dict, key: str, n: int = 7) -> list:
+    return (fin.get(key) or [])[:n]
+
+
+def _ttm(fin: dict, key: str) -> Optional[float]:
+    return fin.get(key)
+
+
+def _safe_pct(numerator, denominator) -> Optional[float]:
+    if numerator is not None and denominator and denominator != 0:
+        return (numerator / denominator) * 100
+    return None
+
+
+def _cagr(series: list, years: int) -> Optional[float]:
+    """CAGR from a most-recent-first list over `years` years."""
+    if len(series) > years and series[years] and series[years] > 0:
+        return ((series[0] / series[years]) ** (1 / years) - 1) * 100
+    if len(series) >= 2 and series[-1] and series[-1] > 0:
+        n = len(series) - 1
+        return ((series[0] / series[-1]) ** (1 / n) - 1) * 100
     return None
 
 
@@ -75,21 +80,16 @@ def is_saas_company(info: dict) -> bool:
     industry = str(info.get("industry", "")).lower()
     sector   = str(info.get("sector",   "")).lower()
     biz      = str(info.get("longBusinessSummary", "")).lower()
-    saas_kw  = ["software", "saas", "cloud", "application software",
-                "software-infrastructure", "internet content"]
-    for kw in saas_kw:
+    kws = ["software", "saas", "cloud", "application software",
+           "software-infrastructure", "internet content"]
+    for kw in kws:
         if kw in industry or kw in sector:
             return True
-    if "subscription" in biz and "software" in biz:
-        return True
-    return False
+    return "subscription" in biz and "software" in biz
 
 
 def classify_company(info: dict) -> str:
-    """
-    Return one of: SAAS, CYCLICAL, DEFENSE, FINANCIAL, REIT, BIOTECH, GENERAL
-    Order matters — more specific checks first.
-    """
+    """Return one of: SAAS CYCLICAL DEFENSE FINANCIAL REIT BIOTECH GENERAL"""
     sector   = str(info.get("sector",   "")).lower()
     industry = str(info.get("industry", "")).lower()
 
@@ -104,11 +104,10 @@ def classify_company(info: dict) -> str:
     if "aerospace & defense" in industry:
         return "DEFENSE"
 
-    cyclical_kw = [
+    if any(k in industry for k in [
         "oil", "gas", "energy", "mining", "metal", "steel", "chemical",
         "semiconductor", "auto", "copper", "aluminum", "coal",
-    ]
-    if any(k in industry for k in cyclical_kw):
+    ]):
         return "CYCLICAL"
 
     if any(k in industry for k in ["biotechnology", "drug manufacturer"]):
@@ -124,247 +123,213 @@ def classify_company(info: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# General metrics — all company types
 # ---------------------------------------------------------------------------
 
-def _get_annual_series(df: pd.DataFrame, label_matches: list, n: int = 7) -> list:
-    """Return up to n annual values (most-recent first) for a row label."""
-    if df is None or df.empty:
-        return []
-    for row_label in df.index:
-        if any(m in str(row_label).lower() for m in label_matches):
-            return [float(v) for v in df.loc[row_label].dropna().sort_index(ascending=False).values[:n]]
-    return []
-
-
-# ---------------------------------------------------------------------------
-# Cycle-normalized FCF margin (for CYCLICAL)
-# ---------------------------------------------------------------------------
-
-def compute_normalized_fcf_margin(
-    income: pd.DataFrame,
-    cashflow: pd.DataFrame,
-    years: int = 7,
-) -> tuple:
-    """Return (normalized_fcf_margin, years_used). Uses up to `years` annual periods."""
-    fcf_vals = _get_annual_series(cashflow, ["free cash flow"], years) if cashflow is not None else []
-    rev_vals = _get_annual_series(income,   ["total revenue", "revenue"], years) if income is not None else []
-    margins  = [f / r for f, r in zip(fcf_vals, rev_vals) if r > 0]
-    if not margins:
-        return 0.08, 0
-    return float(np.mean(margins)), len(margins)
-
-
-# ---------------------------------------------------------------------------
-# General metrics (all company types)
-# ---------------------------------------------------------------------------
-
-def compute_general_metrics(info: dict, financials: dict) -> dict:
-    results  = {}
-    income   = financials.get("income_stmt")
-
+def compute_general_metrics(info: dict, fin: dict) -> dict:
     market_cap = info.get("marketCap")
     ev         = info.get("enterpriseValue")
-    rev_ttm    = info.get("totalRevenue")
 
-    results["Market Cap"]        = market_cap
-    results["Enterprise Value"]  = ev
-    results["TTM Revenue"]       = rev_ttm
+    rev_a  = _annual(fin, "revenue_annual")
+    fcf_a  = _annual(fin, "fcf_annual")
+    gp_a   = _annual(fin, "gross_profit_annual")
+    ni_a   = _annual(fin, "net_income_annual")
+    ebi_a  = _annual(fin, "ebitda_annual")
 
-    # Revenue CAGR 3yr — from annual statements (needs 4 data points for 3yr CAGR)
-    rev_cagr = None
-    rev_series = _get_annual_series(income, ["total revenue", "revenue"], 4)
-    if len(rev_series) >= 4 and rev_series[3] > 0:
-        rev_cagr = ((rev_series[0] / rev_series[3]) ** (1 / 3) - 1) * 100
-    elif len(rev_series) >= 2 and rev_series[-1] > 0:
-        rev_cagr = (rev_series[0] / rev_series[-1] - 1) * 100
-    results["Revenue CAGR 3yr %"] = rev_cagr
+    rev_ttm = _ttm(fin, "revenue_ttm") or (rev_a[0] if rev_a else None)
+    fcf_ttm = _ttm(fin, "fcf_ttm")     or (fcf_a[0] if fcf_a else None)
+    gp_ttm  = _ttm(fin, "gross_profit_ttm") or (gp_a[0] if gp_a else None)
+    ni_ttm  = _ttm(fin, "net_income_ttm")   or (ni_a[0] if ni_a else None)
 
-    ebitda = info.get("ebitda")
-    results["EBITDA Margin %"] = (ebitda / rev_ttm * 100) if (ebitda and rev_ttm) else None
+    ebitda_ttm = ebi_a[0] if ebi_a else None
 
-    gross_margin = info.get("grossMargins")
-    results["Gross Margin %"]  = (gross_margin * 100) if gross_margin else None
+    gross_margin  = _safe_pct(gp_ttm,    rev_ttm)
+    ebitda_margin = _safe_pct(ebitda_ttm, rev_ttm)
+    net_margin    = _safe_pct(ni_ttm,    rev_ttm)
+    fcf_yield     = _safe_pct(fcf_ttm,   market_cap)
 
-    net_margin = info.get("profitMargins")
-    results["Net Margin %"]    = (net_margin * 100) if net_margin else None
+    # Use info gross/net margins as override if EDGAR didn't provide gross profit
+    if gross_margin is None:
+        gm = info.get("grossMargins")
+        gross_margin = gm * 100 if gm else None
+    if net_margin is None:
+        nm = info.get("profitMargins")
+        net_margin = nm * 100 if nm else None
 
-    # FCF: use info (Yahoo TTM) first, then compute from statements
-    fcf = _compute_ttm_fcf(info, financials)
-    results["TTM FCF"]     = fcf
-    results["FCF Yield %"] = ((fcf / market_cap) * 100) if (fcf and market_cap) else None
+    total_debt = fin.get("total_debt") or info.get("totalDebt") or 0
+    cash       = fin.get("cash")       or info.get("totalCash")  or 0
+    net_debt   = fin.get("net_debt",   total_debt - cash)
 
-    results["EV/Revenue"]      = (ev / rev_ttm) if (ev and rev_ttm) else None
-    results["EV/EBITDA"]       = info.get("enterpriseToEbitda")
-    results["P/E (trailing)"]  = info.get("trailingPE")
-    results["P/FCF"]           = (market_cap / fcf) if (fcf and fcf > 0 and market_cap) else None
-
-    total_debt = info.get("totalDebt", 0) or 0
-    cash       = info.get("totalCash",  0) or 0
-    results["Total Debt"]         = total_debt
-    results["Cash & Equivalents"] = cash
-    results["Net Debt"]           = total_debt - cash
-
-    return results
+    return {
+        "Market Cap":          market_cap,
+        "Enterprise Value":    ev,
+        "TTM Revenue":         rev_ttm,
+        "Revenue CAGR 3yr %":  _cagr(rev_a, 3),
+        "Gross Margin %":      gross_margin,
+        "EBITDA Margin %":     ebitda_margin,
+        "Net Margin %":        net_margin,
+        "TTM FCF":             fcf_ttm,
+        "FCF Yield %":         fcf_yield,
+        "EV/Revenue":          (ev / rev_ttm) if (ev and rev_ttm) else None,
+        "EV/EBITDA":           info.get("enterpriseToEbitda"),
+        "P/E (trailing)":      info.get("trailingPE"),
+        "P/FCF":               (market_cap / fcf_ttm) if (fcf_ttm and fcf_ttm > 0 and market_cap) else None,
+        "Total Debt":          total_debt,
+        "Cash & Equivalents":  cash,
+        "Net Debt":            net_debt,
+        "Source":              fin.get("source", "unknown"),
+    }
 
 
 # ---------------------------------------------------------------------------
 # SaaS metrics
 # ---------------------------------------------------------------------------
 
-def compute_saas_metrics(info: dict, financials: dict) -> dict:
-    results  = {}
-    q_income = financials.get("quarterly_income")
-    income   = financials.get("income_stmt")
+def compute_saas_metrics(info: dict, fin: dict) -> dict:
+    rev_a  = _annual(fin, "revenue_annual")
+    rev_ttm = _ttm(fin, "revenue_ttm") or (rev_a[0] if rev_a else None) or info.get("totalRevenue")
+    fcf_ttm = _ttm(fin, "fcf_ttm") or info.get("freeCashflow")
 
-    # --- TTM Revenue: Yahoo pre-computes this, most reliable ---
-    rev_ttm = info.get("totalRevenue")
-    if rev_ttm is None:
-        rev_ttm = _ttm_value(q_income, ["total revenue", "revenue"])
-    results["TTM Revenue"] = rev_ttm
-
-    # --- ARR: most recent single quarter * 4 ---
-    # We need one quarter's value, NOT a TTM sum.
+    # ARR: most recent quarter annualized
+    # Best proxy: TTM revenue / 4 * 4 = TTM (but TTM != ARR for growing cos)
+    # Better: most recent single quarter * 4
+    # We get individual Q from the quarterly series in edgar, but structured dict
+    # doesn't expose individual quarters. Use info["totalRevenue"] / 4 as proxy
+    # since Yahoo uses TTM, then note it's approximate.
     arr = None
-    if q_income is not None and not q_income.empty:
-        for row_label in q_income.index:
-            if any(m in str(row_label).lower() for m in ["total revenue", "revenue"]):
-                vals = q_income.loc[row_label].dropna().sort_index(ascending=False)
-                if len(vals) >= 1:
-                    arr = float(vals.iloc[0]) * 4
-                break
-    results["ARR (approx)"] = arr
+    if rev_ttm:
+        arr = rev_ttm  # TTM ≈ ARR for subscription businesses; true ARR = last Q * 4
+        # If we have at least 2 annual points, recent Q ≈ last_annual/4 * (1 + growth/4)
+        rev_growth_decimal = info.get("revenueGrowth")
+        if rev_growth_decimal is not None and rev_a:
+            # Annualize most recent quarter: rev_ttm is already TTM
+            # A better ARR = TTM * (1 + quarterly_growth)
+            # quarterly_growth ≈ (1 + annual_growth)^0.25 - 1
+            qg = (1 + rev_growth_decimal) ** 0.25 - 1
+            arr = rev_ttm * (1 + qg)
 
-    # --- Revenue Growth YoY ---
-    # info["revenueGrowth"] is Yahoo's pre-computed YoY % (decimal) — use it first.
+    # Revenue growth: Yahoo pre-computed YoY % is most reliable
     rev_growth = info.get("revenueGrowth")
     if rev_growth is not None:
         rev_growth = rev_growth * 100
-    else:
-        # Fallback: two most recent full fiscal years from annual stmt
-        rev_series = _get_annual_series(income, ["total revenue", "revenue"], 2)
-        if len(rev_series) >= 2 and rev_series[1] != 0:
-            rev_growth = ((rev_series[0] / rev_series[1]) - 1) * 100
-    results["Revenue Growth YoY %"] = rev_growth
+    elif len(rev_a) >= 2 and rev_a[1]:
+        rev_growth = (rev_a[0] / rev_a[1] - 1) * 100
 
-    # --- TTM FCF ---
-    ttm_fcf = _compute_ttm_fcf(info, financials)
-    results["TTM FCF"] = ttm_fcf
+    fcf_margin = _safe_pct(fcf_ttm, rev_ttm)
+    rule_of_40 = (rev_growth + fcf_margin) if (rev_growth is not None and fcf_margin is not None) else None
 
-    # --- FCF Margin (use same base: TTM FCF / TTM Revenue) ---
-    fcf_margin = ((ttm_fcf / rev_ttm) * 100) if (ttm_fcf is not None and rev_ttm) else None
-    results["FCF Margin %"] = fcf_margin
-
-    # --- Rule of 40 ---
-    results["Rule of 40"] = (rev_growth + fcf_margin) if (rev_growth is not None and fcf_margin is not None) else None
-    results["NRR"]         = "N/A (requires subscription cohort data)"
-
-    # --- Gross Margin: info has this pre-computed ---
     gm = info.get("grossMargins")
-    results["Gross Margin %"] = (gm * 100) if gm else None
+    gross_margin = (gm * 100) if gm else _safe_pct(
+        _ttm(fin, "gross_profit_ttm") or (_annual(fin, "gross_profit_annual") or [None])[0],
+        rev_ttm
+    )
 
-    return results
+    return {
+        "TTM Revenue":          rev_ttm,
+        "ARR (approx)":         arr,
+        "Revenue Growth YoY %": rev_growth,
+        "TTM FCF":              fcf_ttm,
+        "FCF Margin %":         fcf_margin,
+        "Rule of 40":           rule_of_40,
+        "Gross Margin %":       gross_margin,
+        "NRR":                  "N/A (requires subscription cohort data)",
+    }
 
 
 # ---------------------------------------------------------------------------
-# Financial-sector metrics (banks, insurance, asset managers)
+# Financial sector (banks, insurance)
 # ---------------------------------------------------------------------------
 
-def compute_financial_metrics(info: dict, financials: dict) -> dict:
-    results = {}
-    income  = financials.get("income_stmt")
-
-    results["P/B Ratio"]        = info.get("priceToBook")
+def compute_financial_metrics(info: dict, fin: dict) -> dict:
     roe = info.get("returnOnEquity")
-    results["ROE %"]            = (roe * 100) if roe else None
     div = info.get("dividendYield")
-    results["Dividend Yield %"] = (div * 100) if div else None
-    results["P/E (trailing)"]   = info.get("trailingPE")
-    results["P/E (forward)"]    = info.get("forwardPE")
 
-    # Net Interest Margin proxy
-    nim = None
-    nim_series = _get_annual_series(income, ["net interest income"], 1) if income is not None else []
-    if nim_series:
-        total_assets = info.get("totalAssets")
-        if total_assets and total_assets > 0:
-            nim = (nim_series[0] / total_assets) * 100
-    results["Net Interest Margin % (approx)"] = nim
-    results["Tier 1 Capital Ratio"]           = "N/A — check latest 10-K"
-
-    return results
+    # NIM: net interest income from EDGAR if available
+    # Not a standard XBRL concept we track, so leave as note
+    return {
+        "P/B Ratio":                      info.get("priceToBook"),
+        "ROE %":                          (roe * 100) if roe else None,
+        "Dividend Yield %":               (div * 100) if div else None,
+        "P/E (trailing)":                 info.get("trailingPE"),
+        "P/E (forward)":                  info.get("forwardPE"),
+        "Net Interest Margin % (approx)": None,
+        "Tier 1 Capital Ratio":           "N/A — check latest 10-K",
+        "Data Source":                    fin.get("source", "unknown"),
+    }
 
 
 # ---------------------------------------------------------------------------
 # REIT metrics
 # ---------------------------------------------------------------------------
 
-def compute_reit_metrics(info: dict, financials: dict) -> dict:
-    results = {}
-    income  = financials.get("income_stmt")
-
-    div = info.get("dividendYield")
-    results["Dividend Yield %"] = (div * 100) if div else None
-    results["P/E (trailing)"]   = info.get("trailingPE")
-
-    # FFO proxy = Net Income + D&A
-    ni_series = _get_annual_series(income, ["net income"], 1)  if income is not None else []
-    da_series = _get_annual_series(income, ["depreciation"],  1) if income is not None else []
+def compute_reit_metrics(info: dict, fin: dict) -> dict:
+    ni_a = _annual(fin, "net_income_annual")
+    da_a = _annual(fin, "da_annual")
 
     ffo = None
-    if ni_series and da_series:
-        ffo = ni_series[0] + abs(da_series[0])
-    results["FFO proxy (NI + D&A)"] = ffo
+    if ni_a and da_a:
+        ffo = ni_a[0] + abs(da_a[0])
 
     market_cap = info.get("marketCap")
-    results["P/FFO (proxy)"] = (market_cap / ffo) if (ffo and ffo > 0 and market_cap) else None
-    results["AFFO Note"]     = "AFFO requires maintenance capex split — not in public feeds"
+    div = info.get("dividendYield")
 
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Biotech / pre-revenue metrics
-# ---------------------------------------------------------------------------
-
-def compute_biotech_metrics(info: dict, financials: dict) -> dict:
-    results    = {}
-    q_cashflow = financials.get("quarterly_cashflow")
-
-    cash = info.get("totalCash") or 0
-    results["Cash & Equivalents"] = cash
-
-    quarterly_burn = None
-    if q_cashflow is not None and not q_cashflow.empty:
-        for row_label in q_cashflow.index:
-            if "operating" in str(row_label).lower():
-                vals = q_cashflow.loc[row_label].dropna().sort_index(ascending=False).head(4)
-                outflows = [abs(float(v)) for v in vals if float(v) < 0]
-                if outflows:
-                    quarterly_burn = float(np.mean(outflows))
-                break
-
-    results["Avg Quarterly Cash Burn"] = quarterly_burn
-    results["Cash Runway (quarters)"]  = (cash / quarterly_burn) if (quarterly_burn and quarterly_burn > 0 and cash > 0) else None
-    results["DCF Warning"] = (
-        "DCF not meaningful — negative/near-zero FCF. "
-        "Valuation depends on pipeline probability weighting."
-    )
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Defense / A&D flags
-# ---------------------------------------------------------------------------
-
-def compute_defense_flags(info: dict, financials: dict) -> dict:
     return {
-        "Backlog Note": (
-            "Revenue is backlog-driven (government contracts). "
-            "DCF uses conservative terminal growth capped at 2.0%."
-        ),
-        "_terminal_growth_override": 0.020,
+        "Dividend Yield %":      (div * 100) if div else None,
+        "P/E (trailing)":        info.get("trailingPE"),
+        "FFO proxy (NI + D&A)":  ffo,
+        "P/FFO (proxy)":         (market_cap / ffo) if (ffo and ffo > 0 and market_cap) else None,
+        "AFFO Note":             "AFFO requires maintenance capex split — not in public feeds",
+        "Data Source":           fin.get("source", "unknown"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Biotech / pre-revenue
+# ---------------------------------------------------------------------------
+
+def compute_biotech_metrics(info: dict, fin: dict) -> dict:
+    cash     = fin.get("cash") or info.get("totalCash") or 0
+    op_cf_a  = _annual(fin, "op_cf_annual")
+    # Quarterly burn: approximate from TTM op_cf / 4
+    op_cf_ttm = _ttm(fin, "op_cf_ttm")
+    quarterly_burn = None
+    if op_cf_ttm is not None and op_cf_ttm < 0:
+        quarterly_burn = abs(op_cf_ttm) / 4
+
+    runway = (cash / quarterly_burn) if (quarterly_burn and quarterly_burn > 0 and cash > 0) else None
+
+    return {
+        "Cash & Equivalents":       cash,
+        "Avg Quarterly Cash Burn":  quarterly_burn,
+        "Cash Runway (quarters)":   runway,
+        "DCF Warning":              "DCF not meaningful — negative/near-zero FCF. Valuation depends on pipeline probability weighting.",
+        "Data Source":              fin.get("source", "unknown"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Defense flags
+# ---------------------------------------------------------------------------
+
+def compute_defense_flags(info: dict, fin: dict) -> dict:
+    return {
+        "Backlog Note":               "Revenue is backlog-driven (govt contracts). Terminal growth capped at 2.0%.",
+        "_terminal_growth_override":  0.020,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cyclical: cycle-normalized FCF margin
+# ---------------------------------------------------------------------------
+
+def compute_normalized_fcf_margin(fin: dict, years: int = 7) -> tuple:
+    """Return (normalized_fcf_margin, years_used) using EDGAR annual series."""
+    fcf_a = _annual(fin, "fcf_annual", years)
+    rev_a = _annual(fin, "revenue_annual", years)
+    margins = [f / r for f, r in zip(fcf_a, rev_a) if r > 0]
+    if not margins:
+        return 0.08, 0
+    return float(np.mean(margins)), len(margins)
 
 
 # ---------------------------------------------------------------------------
@@ -374,58 +339,47 @@ def compute_defense_flags(info: dict, financials: dict) -> dict:
 def extract_dcf_inputs_from_data(
     ticker: str,
     info: dict,
-    financials: dict,
+    fin: dict,
     risk_free_rate: float,
     company_type: str = "GENERAL",
 ) -> dict:
     """
-    Extract DCF building blocks from fetched data.
-    Keys prefixed with '_' are metadata for display — pop them before DCFInputs().
+    Build DCFInputs kwargs from info + structured financials dict.
+    Keys prefixed '_' are display metadata — pop before DCFInputs(**).
     """
-    income   = financials.get("income_stmt")
-    cashflow = financials.get("cashflow")
+    rev_a = _annual(fin, "revenue_annual")
+    fcf_a = _annual(fin, "fcf_annual")
 
-    rev_ttm = info.get("totalRevenue")
+    rev_ttm = _ttm(fin, "revenue_ttm") or (rev_a[0] if rev_a else 0) or info.get("totalRevenue") or 0
+    fcf_ttm = _ttm(fin, "fcf_ttm") or (fcf_a[0] if fcf_a else None) or info.get("freeCashflow")
+    if fcf_ttm is None:
+        fcf_ttm = rev_ttm * 0.10
 
-    # Historical annual revenue growth rates (up to 5, oldest first)
-    rev_series = _get_annual_series(income, ["total revenue", "revenue"], 6)
-    revenue_growth_rates = []
-    for i in range(min(5, len(rev_series) - 1)):
-        g = (rev_series[i] / rev_series[i + 1]) - 1
-        revenue_growth_rates.append(g)
-    revenue_growth_rates = list(reversed(revenue_growth_rates)) or [0.07]
+    # Historical revenue growth rates (oldest first, up to 5 years)
+    growth_rates = []
+    for i in range(min(5, len(rev_a) - 1)):
+        if rev_a[i + 1] and rev_a[i + 1] > 0:
+            growth_rates.append(rev_a[i] / rev_a[i + 1] - 1)
+    growth_rates = list(reversed(growth_rates)) or [0.07]
 
-    # FCF margin: cycle-normalized for CYCLICAL, else 3yr average
-    fcf_margin_stable = 0.10
+    # Stable FCF margin
     metadata = {}
-
     if company_type == "CYCLICAL":
-        fcf_margin_stable, yrs = compute_normalized_fcf_margin(income, cashflow, years=7)
+        fcf_margin_stable, yrs = compute_normalized_fcf_margin(fin, years=7)
         metadata["_margin_note"] = (
-            f"FCF margin cycle-normalized over {yrs} yr(s)" if yrs > 0
-            else "FCF margin: insufficient history, using 8% default"
+            f"FCF margin cycle-normalized over {yrs} yr(s) from EDGAR"
+            if yrs > 0 else "Insufficient history — using 8% default"
         )
     else:
-        fcf_vals = _get_annual_series(cashflow, ["free cash flow"], 3) if cashflow is not None else []
-        rev_vals = _get_annual_series(income,   ["total revenue", "revenue"], 3)
-        margins  = [f / r for f, r in zip(fcf_vals, rev_vals) if r > 0]
-        if margins:
-            fcf_margin_stable = float(np.mean(margins))
-
-    # TTM FCF — use robust helper
-    ttm_fcf = _compute_ttm_fcf(info, financials)
-    if ttm_fcf is None:
-        ttm_fcf = (rev_ttm or 0) * fcf_margin_stable
+        margins = [f / r for f, r in zip(fcf_a, rev_a) if r and r > 0]
+        fcf_margin_stable = float(np.mean(margins[:3])) if margins else 0.10
 
     # WACC
-    beta = max(0.3, min(info.get("beta", 1.0) or 1.0, 3.0))
+    beta       = max(0.3, min(info.get("beta", 1.0) or 1.0, 3.0))
     market_cap = info.get("marketCap", 0) or 0
-    total_debt = info.get("totalDebt",  0) or 0
-    total_cash = info.get("totalCash",  0) or 0
-
-    interest_vals = _get_annual_series(income, ["interest expense"], 1) if income is not None else []
-    interest_expense = abs(interest_vals[0]) if interest_vals else None
-    cost_of_debt = (interest_expense / total_debt) if (interest_expense and total_debt > 0) else 0.05
+    total_debt = fin.get("total_debt") or info.get("totalDebt") or 0
+    int_a      = _annual(fin, "interest_expense_annual", 1)
+    cost_of_debt = (int_a[0] / total_debt) if (int_a and total_debt > 0) else 0.05
 
     from dcf import build_wacc, TAX_RATE_DEFAULT, EQUITY_RISK_PREMIUM
     wacc = build_wacc(
@@ -443,20 +397,22 @@ def extract_dcf_inputs_from_data(
         terminal_growth_rate = 0.020
         metadata["_margin_note"] = "Terminal growth capped at 2.0% (defense/govt contract)"
 
-    shares  = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0
-    net_debt = total_debt - total_cash
+    cash    = fin.get("cash") or info.get("totalCash") or 0
+    net_debt = total_debt - cash
+
+    shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0
 
     result = {
-        "ticker": ticker,
-        "current_fcf": ttm_fcf,
-        "revenue_growth_rates": revenue_growth_rates,
-        "fcf_margin_stable": max(fcf_margin_stable, 0.01),
-        "revenue_ttm": rev_ttm or 0,
-        "wacc": wacc,
+        "ticker":               ticker,
+        "current_fcf":          fcf_ttm,
+        "revenue_growth_rates": growth_rates,
+        "fcf_margin_stable":    max(fcf_margin_stable, 0.01),
+        "revenue_ttm":          rev_ttm,
+        "wacc":                 wacc,
         "terminal_growth_rate": terminal_growth_rate,
-        "projection_years": 10,
-        "shares_outstanding": shares,
-        "net_debt": net_debt,
+        "projection_years":     10,
+        "shares_outstanding":   shares,
+        "net_debt":             net_debt,
     }
     result.update(metadata)
     return result
