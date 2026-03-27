@@ -28,6 +28,45 @@ def _ttm_value(quarterly_df: pd.DataFrame, row_label_matches: list) -> Optional[
     return None
 
 
+def _compute_ttm_fcf(info: dict, financials: dict) -> Optional[float]:
+    """
+    Robustly compute TTM FCF.
+    Priority: info["freeCashflow"] → quarterly OpCF-CapEx → annual OpCF-CapEx
+    """
+    # Yahoo pre-computes TTM FCF — most reliable
+    fcf = info.get("freeCashflow")
+    if fcf is not None:
+        return fcf
+
+    # Compute from quarterly: Operating CF - |CapEx|
+    q_cf = financials.get("quarterly_cashflow")
+    if q_cf is not None and not q_cf.empty:
+        op_cf = _ttm_value(q_cf, ["operating cash flow", "cash from operations",
+                                   "net cash from operating"])
+        capex = _ttm_value(q_cf, ["capital expenditure", "capital expenditures",
+                                   "purchase of property", "capex"])
+        if op_cf is not None and capex is not None:
+            return op_cf - abs(capex)
+        # Try direct free cash flow row
+        direct = _ttm_value(q_cf, ["free cash flow"])
+        if direct is not None:
+            return direct
+
+    # Fall back to most recent annual
+    cf = financials.get("cashflow")
+    if cf is not None and not cf.empty:
+        op_vals  = _get_annual_series(cf, ["operating cash flow", "cash from operations"], 1)
+        cap_vals = _get_annual_series(cf, ["capital expenditure", "capital expenditures",
+                                           "purchase of property"], 1)
+        if op_vals and cap_vals:
+            return op_vals[0] - abs(cap_vals[0])
+        direct = _get_annual_series(cf, ["free cash flow"], 1)
+        if direct:
+            return direct[0]
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Company classification
 # ---------------------------------------------------------------------------
@@ -123,7 +162,6 @@ def compute_normalized_fcf_margin(
 def compute_general_metrics(info: dict, financials: dict) -> dict:
     results  = {}
     income   = financials.get("income_stmt")
-    q_cashflow = financials.get("quarterly_cashflow")
 
     market_cap = info.get("marketCap")
     ev         = info.get("enterpriseValue")
@@ -133,12 +171,12 @@ def compute_general_metrics(info: dict, financials: dict) -> dict:
     results["Enterprise Value"]  = ev
     results["TTM Revenue"]       = rev_ttm
 
-    # Revenue CAGR 3yr
+    # Revenue CAGR 3yr — from annual statements (needs 4 data points for 3yr CAGR)
     rev_cagr = None
     rev_series = _get_annual_series(income, ["total revenue", "revenue"], 4)
-    if len(rev_series) >= 4:
+    if len(rev_series) >= 4 and rev_series[3] > 0:
         rev_cagr = ((rev_series[0] / rev_series[3]) ** (1 / 3) - 1) * 100
-    elif len(rev_series) >= 2:
+    elif len(rev_series) >= 2 and rev_series[-1] > 0:
         rev_cagr = (rev_series[0] / rev_series[-1] - 1) * 100
     results["Revenue CAGR 3yr %"] = rev_cagr
 
@@ -151,10 +189,9 @@ def compute_general_metrics(info: dict, financials: dict) -> dict:
     net_margin = info.get("profitMargins")
     results["Net Margin %"]    = (net_margin * 100) if net_margin else None
 
-    fcf = info.get("freeCashflow")
-    if fcf is None and q_cashflow is not None:
-        fcf = _ttm_value(q_cashflow, ["free cash flow"])
-    results["TTM FCF"]   = fcf
+    # FCF: use info (Yahoo TTM) first, then compute from statements
+    fcf = _compute_ttm_fcf(info, financials)
+    results["TTM FCF"]     = fcf
     results["FCF Yield %"] = ((fcf / market_cap) * 100) if (fcf and market_cap) else None
 
     results["EV/Revenue"]      = (ev / rev_ttm) if (ev and rev_ttm) else None
@@ -164,9 +201,9 @@ def compute_general_metrics(info: dict, financials: dict) -> dict:
 
     total_debt = info.get("totalDebt", 0) or 0
     cash       = info.get("totalCash",  0) or 0
-    results["Total Debt"]        = total_debt
+    results["Total Debt"]         = total_debt
     results["Cash & Equivalents"] = cash
-    results["Net Debt"]          = total_debt - cash
+    results["Net Debt"]           = total_debt - cash
 
     return results
 
@@ -176,46 +213,55 @@ def compute_general_metrics(info: dict, financials: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def compute_saas_metrics(info: dict, financials: dict) -> dict:
-    results    = {}
-    q_income   = financials.get("quarterly_income")
-    q_cashflow = financials.get("quarterly_cashflow")
-    income     = financials.get("income_stmt")
+    results  = {}
+    q_income = financials.get("quarterly_income")
+    income   = financials.get("income_stmt")
 
-    # ARR = most recent quarter * 4
+    # --- TTM Revenue: Yahoo pre-computes this, most reliable ---
+    rev_ttm = info.get("totalRevenue")
+    if rev_ttm is None:
+        rev_ttm = _ttm_value(q_income, ["total revenue", "revenue"])
+    results["TTM Revenue"] = rev_ttm
+
+    # --- ARR: most recent single quarter * 4 ---
+    # We need one quarter's value, NOT a TTM sum.
     arr = None
     if q_income is not None and not q_income.empty:
-        rev_series = _get_annual_series(q_income, ["total revenue", "revenue"], 1)
-        if rev_series:
-            arr = rev_series[0] * 4
+        for row_label in q_income.index:
+            if any(m in str(row_label).lower() for m in ["total revenue", "revenue"]):
+                vals = q_income.loc[row_label].dropna().sort_index(ascending=False)
+                if len(vals) >= 1:
+                    arr = float(vals.iloc[0]) * 4
+                break
     results["ARR (approx)"] = arr
 
-    # TTM Revenue
-    ttm_rev = _ttm_value(q_income, ["total revenue", "revenue"]) if q_income is not None else None
-    if ttm_rev is None:
-        rev_s = _get_annual_series(income, ["total revenue", "revenue"], 1)
-        ttm_rev = rev_s[0] if rev_s else None
-    results["TTM Revenue"] = ttm_rev
-
-    # Revenue Growth YoY
-    rev_series = _get_annual_series(income, ["total revenue", "revenue"], 2)
-    rev_growth = ((rev_series[0] / rev_series[1]) - 1) * 100 if len(rev_series) >= 2 else None
+    # --- Revenue Growth YoY ---
+    # info["revenueGrowth"] is Yahoo's pre-computed YoY % (decimal) — use it first.
+    rev_growth = info.get("revenueGrowth")
+    if rev_growth is not None:
+        rev_growth = rev_growth * 100
+    else:
+        # Fallback: two most recent full fiscal years from annual stmt
+        rev_series = _get_annual_series(income, ["total revenue", "revenue"], 2)
+        if len(rev_series) >= 2 and rev_series[1] != 0:
+            rev_growth = ((rev_series[0] / rev_series[1]) - 1) * 100
     results["Revenue Growth YoY %"] = rev_growth
 
-    # TTM FCF
-    ttm_fcf = _ttm_value(q_cashflow, ["free cash flow"]) if q_cashflow is not None else None
-    if ttm_fcf is None:
-        ttm_fcf = info.get("freeCashflow")
+    # --- TTM FCF ---
+    ttm_fcf = _compute_ttm_fcf(info, financials)
     results["TTM FCF"] = ttm_fcf
 
-    fcf_margin = ((ttm_fcf / ttm_rev) * 100) if (ttm_fcf is not None and ttm_rev) else None
+    # --- FCF Margin (use same base: TTM FCF / TTM Revenue) ---
+    fcf_margin = ((ttm_fcf / rev_ttm) * 100) if (ttm_fcf is not None and rev_ttm) else None
     results["FCF Margin %"] = fcf_margin
 
+    # --- Rule of 40 ---
     results["Rule of 40"] = (rev_growth + fcf_margin) if (rev_growth is not None and fcf_margin is not None) else None
     results["NRR"]         = "N/A (requires subscription cohort data)"
 
-    gross_s = _get_annual_series(income, ["gross profit"], 1)
-    rev_s   = _get_annual_series(income, ["total revenue", "revenue"], 1)
-    results["Gross Margin %"] = ((gross_s[0] / rev_s[0]) * 100) if (gross_s and rev_s and rev_s[0]) else None
+    # --- Gross Margin: info has this pre-computed ---
+    gm = info.get("grossMargins")
+    results["Gross Margin %"] = (gm * 100) if gm else None
 
     return results
 
@@ -336,9 +382,8 @@ def extract_dcf_inputs_from_data(
     Extract DCF building blocks from fetched data.
     Keys prefixed with '_' are metadata for display — pop them before DCFInputs().
     """
-    income     = financials.get("income_stmt")
-    cashflow   = financials.get("cashflow")
-    q_cashflow = financials.get("quarterly_cashflow")
+    income   = financials.get("income_stmt")
+    cashflow = financials.get("cashflow")
 
     rev_ttm = info.get("totalRevenue")
 
@@ -367,10 +412,8 @@ def extract_dcf_inputs_from_data(
         if margins:
             fcf_margin_stable = float(np.mean(margins))
 
-    # TTM FCF
-    ttm_fcf = info.get("freeCashflow")
-    if ttm_fcf is None and q_cashflow is not None:
-        ttm_fcf = _ttm_value(q_cashflow, ["free cash flow"])
+    # TTM FCF — use robust helper
+    ttm_fcf = _compute_ttm_fcf(info, financials)
     if ttm_fcf is None:
         ttm_fcf = (rev_ttm or 0) * fcf_margin_stable
 
